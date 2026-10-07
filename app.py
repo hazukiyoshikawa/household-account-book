@@ -1,42 +1,41 @@
-"""家計簿ダッシュボード — Streamlit 単一ファイルアプリ"""
+"""家計簿ダッシュボード — Streamlit 単一ファイルアプリ（Supabase版・日付ベース集計）
+
+方針:
+- DBに「集計月」カラムは持たない。読み込み時に「日付」から YYYY-MM を作ってメモリ上だけで使う。
+- 例: 9/1〜9/30 の日付は 2026-09 として集計される。
+"""
 
 from __future__ import annotations
 
-import json
-import os
 from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
-import streamlit as st
-from supabase import create_client, Client
 import plotly.express as px
 import streamlit as st
+from supabase import Client, create_client
 
-# Supabase 接続の初期化
+# =========================================================
+# ページ設定（最初の Streamlit コマンド）
+# =========================================================
+st.set_page_config(page_title="家計簿アプリ", layout="wide")
+
+
+# =========================================================
+# Supabase 接続
+# =========================================================
 @st.cache_resource
 def init_supabase() -> Client:
     url = st.secrets["supabase"]["SUPABASE_URL"]
     key = st.secrets["supabase"]["SUPABASE_KEY"]
     return create_client(url, key)
 
-supabase = init_supabase()
 
-# =========================================================
-# ページ設定
-# =========================================================
-st.set_page_config(page_title="家計簿アプリ", layout="wide")
+supabase = init_supabase()
 
 # =========================================================
 # 定数・マスター定義
 # =========================================================
-DATA_FILE = "household_expenses.csv"
-INCOME_FILE = "household_income.csv"
-FIXED_FILE = "household_fixed_monthly.csv"
-VAR_BUDGET_FILE = "household_variable_budgets.csv"
-FIXED_BUDGET_FILE = "household_fixed_budgets.csv"
-SETTINGS_FILE = "household_settings.json"
-
 GROUP_ORDER = ["生活費", "個人支出", "お小遣い"]
 
 CATEGORIES: dict[str, list[str]] = {
@@ -92,9 +91,11 @@ PAYMENT_METHODS = [
 
 INCOME_TYPES = ["本業", "副業", "臨時収入", "その他"]
 
-EXP_COLUMNS = ["日付", "区分", "カテゴリ", "内容", "金額", "支払い方法", "集計月", "備考"]
-INC_COLUMNS = ["日付", "種別", "金額", "集計月", "備考"]
-FIX_COLUMNS = ["集計月", "項目", "金額", "備考"]
+# 「集計月」はDBには存在せず、読み込み時に日付から作るメモリ上の列
+EXP_COLUMNS = ["id", "日付", "区分", "カテゴリ", "内容", "金額", "支払い方法", "集計月", "備考"]
+INC_COLUMNS = ["id", "日付", "種別", "金額", "集計月", "備考"]
+FIX_COLUMNS = ["id", "日付", "集計月", "項目", "金額", "備考"]
+
 
 # =========================================================
 # ユーティリティ
@@ -126,18 +127,7 @@ def to_date(value: Any) -> date:
 def month_key(d: date | datetime | str) -> str:
     if isinstance(d, str):
         return d[:7]
-    if isinstance(d, datetime):
-        return d.strftime("%Y-%m")
     return d.strftime("%Y-%m")
-
-
-def ensure_month_column(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    if "日付" in df.columns:
-        df = df.copy()
-        df["集計月"] = df["日付"].map(lambda x: month_key(to_date(x)))
-    return df
 
 
 def rate_band(rate: float) -> str:
@@ -178,7 +168,6 @@ def rate_color(rate: float) -> str:
 def rate_text_color(rate: float) -> str:
     """背景色に対して読みやすい文字色。"""
     band = rate_band(rate)
-    # 明るい帯は黒、暗い帯は白
     if band in ("0%", "25–49%", "50–74%", "75–89%"):
         return "#1a1a1a"
     return "#ffffff"
@@ -231,169 +220,137 @@ def iter_months(start: str, end: str) -> list[str]:
     return out
 
 
-# --- Supabase データ読み書き関数 ---
+# =========================================================
+# Supabase 読み込み
+# =========================================================
+def fetch_all(table: str) -> list[dict]:
+    """Supabase は1回で最大1000件なので、ページングして全件取得。"""
+    rows: list[dict] = []
+    start, size = 0, 1000
+    while True:
+        res = supabase.table(table).select("*").range(start, start + size - 1).execute()
+        chunk = res.data or []
+        rows.extend(chunk)
+        if len(chunk) < size:
+            break
+        start += size
+    return rows
+
+
+def _build_df(
+    rows: list[dict],
+    rename_map: dict[str, str],
+    columns: list[str],
+    label: str = "",
+) -> pd.DataFrame:
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    df = df.rename(columns=rename_map)
+    for col in columns:
+        if col not in df.columns:
+            df[col] = 0 if col == "金額" else ""
+    if df.empty:
+        return df[columns]
+
+    # 日付に変換できない行（NULL・空文字など）は除外
+    df["日付"] = pd.to_datetime(df["日付"], errors="coerce")
+    bad = df["日付"].isna()
+    if bad.any():
+        st.warning(f"{label or 'データ'}: 日付が空の行が {int(bad.sum())} 件あるため除外しました。")
+        df = df[~bad].copy()
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df["日付"] = df["日付"].dt.date
+    # 集計月は日付から作る（メモリ上のみ。DBには保存しない）
+    df["集計月"] = df["日付"].map(lambda d: d.strftime("%Y-%m"))
+    df["金額"] = pd.to_numeric(df["金額"], errors="coerce").fillna(0).astype(int)
+    return df[columns].reset_index(drop=True)
+
 
 def load_expenses() -> pd.DataFrame:
-    """支出データの取得"""
-    columns_map = {
-        "date": "日付",
-        "group_name": "区分",
-        "category": "カテゴリ",
-        "content": "内容",
-        "amount": "金額",
-        "payment_method": "支払い方法",
-        "month_key": "集計月",
-        "note": "備考"
-    }
-    res = supabase.table("expenses").select("*").execute()
-    data = res.data
-    if not data:
-        return pd.DataFrame(columns=list(columns_map.values()))
-    df = pd.DataFrame(data)
-    df = df.rename(columns=columns_map)
-    for col in columns_map.values():
-        if col not in df.columns:
-            df[col] = None
-    return df
+    return _build_df(
+        fetch_all("expenses"),
+        {
+            "date": "日付",
+            "group_name": "区分",
+            "category": "カテゴリ",
+            "content": "内容",
+            "amount": "金額",
+            "payment_method": "支払い方法",
+            "note": "備考",
+        },
+        EXP_COLUMNS,
+    )
+
 
 def load_income() -> pd.DataFrame:
-    """収入データの取得"""
-    columns_map = {
-        "date": "日付",
-        "type": "区分",
-        "amount": "金額",
-        "month_key": "集計月",
-        "note": "備考"
-    }
-    res = supabase.table("income").select("*").execute()
-    data = res.data
-    if not data:
-        return pd.DataFrame(columns=list(columns_map.values()))
-    df = pd.DataFrame(data)
-    df = df.rename(columns=columns_map)
-    for col in columns_map.values():
-        if col not in df.columns:
-            df[col] = None
-    return df
-
-def save_expense_item(date_str: str, group: str, category: str, content: str, amount: int, pay_method: str, month_key: str, note: str):
-    """支出データの新規保存"""
-    payload = {
-        "date": date_str,
-        "group_name": group,
-        "category": category,
-        "content": content,
-        "amount": amount,
-        "payment_method": pay_method,
-        "month_key": month_key,
-        "note": note
-    }
-    supabase.table("expenses").insert(payload).execute()
-
-def delete_expense_item(expense_id: int):
-    """支出データの削除"""
-    supabase.table("expenses").delete().eq("id", expense_id).execute()
-
-def load_app_settings() -> dict:
-    """設定の読み込み"""
-    res = supabase.table("app_settings").select("value").eq("key", "main_settings").execute()
-    if res.data:
-        return res.data[0]["value"]
-    return {}
-
-def save_app_settings(settings_dict: dict):
-    """設定の保存"""
-    payload = {"key": "main_settings", "value": settings_dict}
-    supabase.table("app_settings").upsert(payload).execute()
+    return _build_df(
+        fetch_all("income"),
+        {"date": "日付", "type": "種別", "amount": "金額", "note": "備考"},
+        INC_COLUMNS,
+    )
 
 
 def load_fixed_monthly() -> pd.DataFrame:
-    """固定費（確定額）データの取得"""
-    columns_map = {
-        "month_key": "集計月",
-        "item": "項目",
-        "amount": "金額",
-        "note": "備考"
-    }
-    
-    res = supabase.table("fixed_monthly").select("*").execute()
-    data = res.data
-    
-    # データが存在しない場合は空のデータフレームを正しいカラム構造で作成
-    if not data:
-        return pd.DataFrame(columns=list(columns_map.values()))
-    
-    df = pd.DataFrame(data)
-    
-    # カラムのリネーム（不足しているカラムがあれば補完）
-    df = df.rename(columns=columns_map)
-    for col in columns_map.values():
-        if col not in df.columns:
-            df[col] = None
-            
-    return df
+    return _build_df(
+        fetch_all("fixed_monthly"),
+        {"date": "日付", "item": "項目", "amount": "金額", "note": "備考"},
+        FIX_COLUMNS,
+    )
+
 
 def load_data():
     """支出・収入・固定費をまとめて読み込む"""
-    df_exp = load_expenses()
-    df_inc = load_income()
-    df_fix = load_fixed_monthly()
-    return df_exp, df_inc, df_fix
+    return load_expenses(), load_income(), load_fixed_monthly()
 
-# --- 予算マスター（変動費・固定費）の読み書き関数 ---
 
+# --- 予算マスター ---
 def load_var_budgets() -> dict[str, int]:
-    """変動費予算の取得"""
+    """変動費予算の取得（DBに無いカテゴリはデフォルト値）。"""
     res = supabase.table("variable_budgets").select("category, budget").execute()
-    data = res.data
-    if not data:
-        # 初期設定がない場合のデフォルト予算（必要に応じて調整してください）
-        return {cat: 10000 for group in GROUP_ORDER for cat in CATEGORIES[group]}
-    return {row["category"]: int(row["budget"]) for row in data}
+    db = {row["category"]: int(row["budget"]) for row in (res.data or [])}
+    return {**DEFAULT_VAR_BUDGET, **db}
 
-def save_var_budgets(var_budgets: dict[str, int]):
-    """変動費予算の保存"""
+
+def save_var_budgets(var_budgets: dict[str, int]) -> None:
     records = []
     for group in GROUP_ORDER:
         for cat in CATEGORIES[group]:
             if cat in var_budgets:
-                records.append({
-                    "category": cat,
-                    "budget": int(var_budgets[cat]),
-                    "group_name": group
-                })
+                records.append(
+                    {"category": cat, "budget": int(var_budgets[cat]), "group_name": group}
+                )
     if records:
         supabase.table("variable_budgets").upsert(records).execute()
 
 
 def load_fixed_budgets() -> dict[str, int]:
-    """固定費標準予算の取得"""
+    """固定費標準予算の取得（DBに無ければデフォルト）。"""
     res = supabase.table("fixed_budgets").select("item, budget").execute()
-    data = res.data
+    data = res.data or []
     if not data:
-        return {}
+        return dict(DEFAULT_FIXED_BUDGET)
     return {row["item"]: int(row["budget"]) for row in data}
 
-def save_fixed_budgets(fixed_budgets: dict[str, int]):
-    """固定費標準予算の保存"""
+
+def save_fixed_budgets(fixed_budgets: dict[str, int]) -> None:
     records = [{"item": k, "budget": int(v)} for k, v in fixed_budgets.items()]
     if records:
         supabase.table("fixed_budgets").upsert(records).execute()
 
-# --- アプリ設定（JSON）の読み書き関数 ---
 
+# --- アプリ設定 ---
 def load_settings() -> dict:
-    """設定の読み込み（Supabaseのapp_settingsテーブルから取得）"""
     try:
         res = supabase.table("app_settings").select("value").eq("key", "main_settings").execute()
-        if res.data and len(res.data) > 0:
+        if res.data:
             return res.data[0]["value"]
     except Exception as e:
         st.error(f"設定の読み込みエラー: {e}")
     return {}
 
-def save_settings(settings_dict: dict):
-    """設定の保存（Supabaseのapp_settingsテーブルへ保存）"""
+
+def save_settings(settings_dict: dict) -> None:
     try:
         payload = {"key": "main_settings", "value": settings_dict}
         supabase.table("app_settings").upsert(payload).execute()
@@ -402,18 +359,81 @@ def save_settings(settings_dict: dict):
 
 
 # =========================================================
-# CRUD 共通ヘルパー
+# Supabase 書き込み（「集計月」はDBに送らない）
 # =========================================================
+def _exp_record(r: Any) -> dict[str, Any]:
+    return {
+        "date": str(to_date(r["日付"])),
+        "group_name": str(r["区分"]),
+        "category": str(r["カテゴリ"]),
+        "content": clean_text(r["内容"]),
+        "amount": to_int_amount(r["金額"]),
+        "payment_method": str(r["支払い方法"]),
+        "note": clean_text(r["備考"]),
+    }
+
+
+def _inc_record(r: Any) -> dict[str, Any]:
+    return {
+        "date": str(to_date(r["日付"])),
+        "type": str(r["種別"]),
+        "amount": to_int_amount(r["金額"]),
+        "note": clean_text(r["備考"]),
+    }
+
+
+def _fix_record(r: Any) -> dict[str, Any]:
+    # fixed_monthly テーブルに note 列がある場合は "note": clean_text(r["備考"]) を追加してください
+    return {
+        "date": str(to_date(r["日付"])),
+        "item": str(r["項目"]),
+        "amount": to_int_amount(r["金額"]),
+    }
+
+
+def _upsert_with_id(table: str, df: pd.DataFrame, to_record) -> None:
+    """id を持つ既存行だけを upsert（更新）。"""
+    recs = []
+    for _, row in df.iterrows():
+        rid = row.get("id")
+        if rid is None or rid == "" or pd.isna(rid):
+            continue
+        rec = to_record(row)
+        rec["id"] = int(rid)
+        recs.append(rec)
+    if recs:
+        supabase.table(table).upsert(recs).execute()
+
+
+def save_all_data() -> None:
+    """編集済みのセッション状態を Supabase に反映。"""
+    try:
+        _upsert_with_id("expenses", st.session_state.df_exp, _exp_record)
+        _upsert_with_id("income", st.session_state.df_inc, _inc_record)
+        _upsert_with_id("fixed_monthly", st.session_state.df_fix, _fix_record)
+    except Exception as e:
+        st.error(f"保存時にエラーが発生しました: {e}")
+
+
 def append_expense(row: dict[str, Any]) -> None:
-    new_df = pd.DataFrame([row], columns=EXP_COLUMNS)
-    st.session_state.df_exp = pd.concat([st.session_state.df_exp, new_df], ignore_index=True)
-    save_all_data()
+    supabase.table("expenses").insert(_exp_record(row)).execute()
+    st.session_state.df_exp = load_expenses()  # DB採番の id を取り込む
 
 
 def append_income(row: dict[str, Any]) -> None:
-    new_df = pd.DataFrame([row], columns=INC_COLUMNS)
-    st.session_state.df_inc = pd.concat([st.session_state.df_inc, new_df], ignore_index=True)
-    save_all_data()
+    supabase.table("income").insert(_inc_record(row)).execute()
+    st.session_state.df_inc = load_income()
+
+
+def delete_by_positions(
+    table: str, source_df: pd.DataFrame, orig_indices: pd.Index, selected_positions: list[int]
+) -> pd.DataFrame:
+    """edited_df の行位置から元 index を特定し、DB と session の両方から削除。"""
+    to_drop = [orig_indices[pos] for pos in selected_positions if 0 <= pos < len(orig_indices)]
+    ids = [int(source_df.loc[i, "id"]) for i in to_drop]
+    if ids:
+        supabase.table(table).delete().in_("id", ids).execute()
+    return source_df.drop(to_drop).reset_index(drop=True)
 
 
 def apply_edits(
@@ -459,7 +479,6 @@ def apply_edits(
                     df.loc[orig_idx, "区分"] = correct_group
                     changed = True
             else:
-                # 不正カテゴリは区分に合わせて先頭カテゴリへ
                 group = str(df.loc[orig_idx, "区分"])
                 if group not in CATEGORIES:
                     group = GROUP_ORDER[0]
@@ -468,12 +487,6 @@ def apply_edits(
                 changed = True
 
     return df, changed
-
-
-def delete_by_positions(source_df: pd.DataFrame, orig_indices: pd.Index, selected_positions: list[int]) -> pd.DataFrame:
-    """edited_df の行位置 (0-based) から元 index を特定して削除。"""
-    to_drop = [orig_indices[pos] for pos in selected_positions if 0 <= pos < len(orig_indices)]
-    return source_df.drop(to_drop).reset_index(drop=True)
 
 
 # =========================================================
@@ -485,6 +498,7 @@ def resolve_sinking_start(name: str, selected_month: str, settings: dict[str, An
     if start:
         return start[:7]
     return selected_month
+
 
 def furniture_monthly_contrib(settings: dict[str, Any], var_budgets: dict[str, int]) -> int:
     """家具家電の月次積立額を settings から最優先で取得。なければ var_budgets を参照。"""
@@ -499,6 +513,7 @@ def allowance_monthly_contrib(settings: dict[str, Any], var_budgets: dict[str, i
         return int(settings["積立額_お小遣い"])
     return sum(int(var_budgets.get(cat, 0)) for cat in CATEGORIES["お小遣い"])
 
+
 def calc_sinking_fund(
     df_exp: pd.DataFrame,
     monthly_contrib: int,
@@ -508,10 +523,7 @@ def calc_sinking_fund(
     category: str | None = None,
     group: str | None = None,
 ) -> dict[str, int | float]:
-    """
-    積立の累計状況。
-    毎月の拠出額を積み上げ、該当カテゴリ/区分の支出を差し引いた残高を返す。
-    """
+    """積立の累計状況。毎月の拠出額を積み上げ、該当カテゴリ/区分の支出を差し引いた残高を返す。"""
     if not start_month:
         start_month = up_to_month
     if start_month > up_to_month:
@@ -524,17 +536,14 @@ def calc_sinking_fund(
         spent = 0
         month_spent = 0
     else:
-        # 開始月から選択月までの範囲を対象
         base_mask = (df_exp["集計月"] >= start_month) & (df_exp["集計月"] <= up_to_month)
         month_mask = df_exp["集計月"] == up_to_month
 
         if category is not None:
-            # カテゴリ名の一致判定（文字列の前後の空白を無視）
             cat_mask = df_exp["カテゴリ"].astype(str).str.strip() == category
             spent = int(df_exp.loc[base_mask & cat_mask, "金額"].sum())
             month_spent = int(df_exp.loc[month_mask & cat_mask, "金額"].sum())
         elif group is not None:
-            # 区分名の一致判定、またはお小遣いグループ内カテゴリの判定
             grp_mask = df_exp["区分"].astype(str).str.strip() == group
             if group in CATEGORIES:
                 cat_in_grp_mask = df_exp["カテゴリ"].astype(str).str.strip().isin(CATEGORIES[group])
@@ -560,10 +569,7 @@ def calc_sinking_fund(
     }
 
 
-def calc_savings_reserve(
-    up_to_month: str,
-    settings: dict[str, Any],
-) -> dict[str, int | float | str]:
+def calc_savings_reserve(up_to_month: str, settings: dict[str, Any]) -> dict[str, int | float | str]:
     """月次貯蓄額 × 経過月数の確保額。"""
     monthly = int(settings.get("月次貯蓄額", 0) or 0)
     start = str(settings.get("貯蓄開始月", "") or "").strip()[:7]
@@ -579,6 +585,81 @@ def calc_savings_reserve(
         "reserved": reserved,
         "start_month": start,
     }
+
+
+def get_fixed_for_month(df_fix: pd.DataFrame, month: str, fixed_budgets: dict):
+    """
+    指定月の固定費を取得。戻り値: (DataFrame, is_virtual)
+    DBに該当月のデータが無ければ標準予算から仮想行を作る。
+    """
+    if df_fix is not None and not df_fix.empty:
+        current = df_fix[df_fix["集計月"] == month]
+        if not current.empty:
+            return current[["id", "項目", "金額", "備考"]].copy(), False
+
+    budgets_to_use = fixed_budgets if fixed_budgets else DEFAULT_FIXED_BUDGET
+    virtual = pd.DataFrame(
+        [{"項目": k, "金額": v, "備考": "標準目安額"} for k, v in budgets_to_use.items()]
+    )
+    return virtual, True
+
+
+def persist_fixed_month(
+    edited: pd.DataFrame, month: str, is_virtual: bool, orig_indices: pd.Index | None
+) -> None:
+    if is_virtual:
+        # 仮想データを実データとして登録（日付はその月の1日）
+        recs = [
+            {"date": f"{month}-01", "item": r["項目"], "amount": to_int_amount(r["金額"])}
+            for _, r in edited.iterrows()
+        ]
+        if recs:
+            supabase.table("fixed_monthly").insert(recs).execute()
+        st.session_state.df_fix = load_fixed_monthly()
+        return
+
+    assert orig_indices is not None
+    df, changed = apply_edits(st.session_state.df_fix, edited, orig_indices, ["金額", "備考"])
+    if changed:
+        st.session_state.df_fix = df
+        save_all_data()
+
+
+def month_totals(
+    df_exp: pd.DataFrame,
+    df_inc: pd.DataFrame,
+    df_fix: pd.DataFrame,
+    month: str,
+    fixed_budgets: dict[str, int],
+) -> dict[str, int]:
+    m_exp = df_exp[df_exp["集計月"] == month] if not df_exp.empty else pd.DataFrame()
+    m_inc = df_inc[df_inc["集計月"] == month] if not df_inc.empty else pd.DataFrame()
+    fix_df, _ = get_fixed_for_month(df_fix, month, fixed_budgets)
+    income = int(m_inc["金額"].sum()) if not m_inc.empty else 0
+    fixed = int(fix_df["金額"].sum()) if not fix_df.empty else 0
+    variable = int(m_exp["金額"].sum()) if not m_exp.empty else 0
+    net = income - fixed - variable
+    return {"income": income, "fixed": fixed, "variable": variable, "net": net}
+
+
+def collect_months(df_exp: pd.DataFrame, df_inc: pd.DataFrame, df_fix: pd.DataFrame) -> list[str]:
+    months: set[str] = set()
+    for df in (df_exp, df_inc, df_fix):
+        if not df.empty and "集計月" in df.columns:
+            months.update(df["集計月"].dropna().astype(str).tolist())
+
+    # 今月を追加
+    months.add(datetime.today().strftime("%Y-%m"))
+
+    # 最新月の1か月後も選択肢に追加
+    y, m = map(int, max(months).split("-"))
+    m += 1
+    if m > 12:
+        m = 1
+        y += 1
+    months.add(f"{y:04d}-{m:02d}")
+
+    return sorted(months, reverse=True)
 
 
 def calc_raw_net_through(
@@ -608,10 +689,7 @@ def free_cash_as_of(
     var_budgets: dict[str, int],
     settings: dict[str, Any],
 ) -> dict[str, int]:
-    """
-    手元の自由資金。
-    生の累計収支から、家具家電積立残高・お小遣い積立残高・貯蓄確保額（いずれもプラス分）を引く。
-    """
+    """手元の自由資金。生の累計収支から、積立残高・貯蓄確保額（プラス分）を引く。"""
     raw = calc_raw_net_through(df_exp, df_inc, df_fix, up_to_month, fixed_budgets, before=False)
 
     furn_monthly = furniture_monthly_contrib(settings, var_budgets)
@@ -646,6 +724,26 @@ def free_cash_as_of(
         "reserved_savings": reserved_savings,
         "reserved_total": reserved_total,
     }
+
+
+def calc_carryover(
+    df_exp: pd.DataFrame,
+    df_inc: pd.DataFrame,
+    df_fix: pd.DataFrame,
+    selected_month: str,
+    fixed_budgets: dict[str, int],
+    var_budgets: dict[str, int],
+    settings: dict[str, Any],
+) -> int:
+    """選択月より前までの自由資金繰越。"""
+    all_m = collect_months(df_exp, df_inc, df_fix)
+    prior = sorted(m for m in all_m if m < selected_month)
+    if not prior:
+        return 0
+    prev_month = prior[-1]
+    return free_cash_as_of(
+        df_exp, df_inc, df_fix, prev_month, fixed_budgets, var_budgets, settings
+    )["free"]
 
 
 def build_category_budget_df(
@@ -685,8 +783,8 @@ def build_category_budget_df(
                         "運用": "積立",
                         "予算": furn_monthly,
                         "実績": actual_val,
-                        "残予算": int(furn_fund["balance"]),      # ← fund を furn_fund に修正
-                        "使用率(%)": float(furn_fund["cum_rate"]), # ← fund を furn_fund に修正
+                        "残予算": int(furn_fund["balance"]),
+                        "使用率(%)": float(furn_fund["cum_rate"]),
                     }
                 )
             elif group in SINKING_FUND_GROUPS:
@@ -721,7 +819,6 @@ def build_group_budget_df(
     budget_df: pd.DataFrame,
     allowance_fund: dict[str, int | float] | None = None,
 ) -> pd.DataFrame:
-    # 区分集計は「今月の予算・実績」ベース
     g = (
         budget_df.groupby("区分", as_index=False)
         .agg(予算=("予算", "sum"), 実績=("実績", "sum"))
@@ -731,7 +828,6 @@ def build_group_budget_df(
         lambda r: round((r["実績"] / r["予算"]) * 100, 1) if r["予算"] > 0 else 0.0,
         axis=1,
     )
-    # お小遣いは区分積立残高・累計使用率で上書き
     if allowance_fund is not None and "お小遣い" in set(g["区分"]):
         mask = g["区分"] == "お小遣い"
         g.loc[mask, "残予算"] = int(allowance_fund["balance"])
@@ -771,112 +867,6 @@ def usage_bar_chart(df: pd.DataFrame, y_col: str, title: str = "", height: int =
     return fig
 
 
-def default_fixed_rows(month: str, fixed_budgets: dict[str, int]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {"集計月": month, "項目": item, "金額": amount, "備考": "標準目安額"}
-            for item, amount in fixed_budgets.items()
-        ]
-    )
-
-
-def get_fixed_for_month(df_fix: pd.DataFrame, month: str, fixed_budgets: dict[str, int]) -> tuple[pd.DataFrame, bool]:
-    """表示用固定費。未登録月はデフォルトを返し、is_virtual=True。"""
-    current = df_fix[df_fix["集計月"] == month].copy()
-    if current.empty:
-        return default_fixed_rows(month, fixed_budgets), True
-    return current, False
-
-
-def persist_fixed_month(edited: pd.DataFrame, month: str, is_virtual: bool, orig_indices: pd.Index | None) -> None:
-    if is_virtual:
-        # 仮想データを実データとして追加
-        new_rows = edited.copy()
-        new_rows["集計月"] = month
-        new_rows["金額"] = new_rows["金額"].map(to_int_amount)
-        new_rows["備考"] = new_rows["備考"].map(lambda x: clean_text(x))
-        st.session_state.df_fix = pd.concat(
-            [st.session_state.df_fix, new_rows[FIX_COLUMNS]],
-            ignore_index=True,
-        )
-        save_all_data()
-        return
-
-    assert orig_indices is not None
-    df, changed = apply_edits(
-        st.session_state.df_fix,
-        edited,
-        orig_indices,
-        ["金額", "備考"],
-    )
-    if changed:
-        st.session_state.df_fix = df
-        save_all_data()
-
-
-def month_totals(
-    df_exp: pd.DataFrame,
-    df_inc: pd.DataFrame,
-    df_fix: pd.DataFrame,
-    month: str,
-    fixed_budgets: dict[str, int],
-) -> dict[str, int]:
-    m_exp = df_exp[df_exp["集計月"] == month] if not df_exp.empty else pd.DataFrame()
-    m_inc = df_inc[df_inc["集計月"] == month] if not df_inc.empty else pd.DataFrame()
-    fix_df, _ = get_fixed_for_month(df_fix, month, fixed_budgets)
-    income = int(m_inc["金額"].sum()) if not m_inc.empty else 0
-    fixed = int(fix_df["金額"].sum()) if not fix_df.empty else 0
-    variable = int(m_exp["金額"].sum()) if not m_exp.empty else 0
-    net = income - fixed - variable
-    return {"income": income, "fixed": fixed, "variable": variable, "net": net}
-
-
-def collect_months(df_exp: pd.DataFrame, df_inc: pd.DataFrame, df_fix: pd.DataFrame) -> list[str]:
-    months: set[str] = set()
-    for df in (df_exp, df_inc, df_fix):
-        if not df.empty and "集計月" in df.columns:
-            months.update(df["集計月"].dropna().astype(str).tolist())
-    
-    # 今月を取得
-    today_str = datetime.today().strftime("%Y-%m")
-    months.add(today_str)
-
-    # 登録・選択されている最新月を取得し、その「1か月後」も選択肢に追加
-    max_month_str = max(months)
-    y, m = map(int, max_month_str.split("-"))
-    m += 1
-    if m > 12:
-        m = 1
-        y += 1
-    next_month_str = f"{y:04d}-{m:02d}"
-    months.add(next_month_str)
-
-    return sorted(months, reverse=True)
-
-
-def calc_carryover(
-    df_exp: pd.DataFrame,
-    df_inc: pd.DataFrame,
-    df_fix: pd.DataFrame,
-    selected_month: str,
-    fixed_budgets: dict[str, int],
-    var_budgets: dict[str, int],
-    settings: dict[str, Any],
-) -> int:
-    """
-    選択月より前までの自由資金繰越。
-    前月時点の生収支累計から、積立残高・貯蓄確保を差し引く。
-    """
-    all_m = collect_months(df_exp, df_inc, df_fix)
-    prior = sorted(m for m in all_m if m < selected_month)
-    if not prior:
-        return 0
-    prev_month = prior[-1]
-    return free_cash_as_of(
-        df_exp, df_inc, df_fix, prev_month, fixed_budgets, var_budgets, settings
-    )["free"]
-
-
 def build_monthly_trend(
     df_exp: pd.DataFrame,
     df_inc: pd.DataFrame,
@@ -904,22 +894,12 @@ def build_monthly_trend(
 # =========================================================
 if "df_exp" not in st.session_state:
     st.session_state.df_exp, st.session_state.df_inc, st.session_state.df_fix = load_data()
-    # スキーマ移行（支払い方法列など）をディスクへ反映
-    st.session_state.df_exp.to_csv(DATA_FILE, index=False)
-    st.session_state.df_inc.to_csv(INCOME_FILE, index=False)
-    st.session_state.df_fix.to_csv(FIXED_FILE, index=False)
 if "var_budgets" not in st.session_state:
     st.session_state.var_budgets = load_var_budgets()
-    if not os.path.exists(VAR_BUDGET_FILE):
-        save_var_budgets(st.session_state.var_budgets)
 if "fixed_budgets" not in st.session_state:
     st.session_state.fixed_budgets = load_fixed_budgets()
-    if not os.path.exists(FIXED_BUDGET_FILE):
-        save_fixed_budgets(st.session_state.fixed_budgets)
 if "settings" not in st.session_state:
     st.session_state.settings = load_settings()
-    if not os.path.exists(SETTINGS_FILE):
-        save_settings(st.session_state.settings)
 
 df_exp: pd.DataFrame = st.session_state.df_exp
 df_inc: pd.DataFrame = st.session_state.df_inc
@@ -928,10 +908,11 @@ var_budgets: dict[str, int] = st.session_state.var_budgets
 fixed_budgets: dict[str, int] = st.session_state.fixed_budgets
 settings: dict[str, Any] = st.session_state.settings
 
+
 # =========================================================
 # 登録ダイアログ
 # =========================================================
-@st.dialog("変動費を登録")
+@st.dialog("変動費の登録")
 def dialog_add_expense(default_month: str):
     today = datetime.today().date()
     try:
@@ -944,11 +925,10 @@ def dialog_add_expense(default_month: str):
     d = st.date_input("日付", default_date)
     group = st.selectbox("区分", GROUP_ORDER)
     category = st.selectbox("カテゴリ", CATEGORIES[group])
-    st.caption("区分を変えると、選べるカテゴリも切り替わります。")
     item_name = st.text_input("内容（店舗・目的など）", placeholder="例: セブンイレブン")
-    amount = st.number_input("金額（円）", min_value=0, step=100, value=0)
+    amount = st.number_input("金額（円）", min_value=0, step=100)
     pay = st.selectbox("支払い方法", PAYMENT_METHODS)
-    note = st.text_input("備考", placeholder="補足があれば入力")
+    note = st.text_input("備考")
 
     if st.button("登録する", type="primary", use_container_width=True):
         append_expense(
@@ -959,7 +939,6 @@ def dialog_add_expense(default_month: str):
                 "内容": clean_text(item_name),
                 "金額": int(amount),
                 "支払い方法": pay,
-                "集計月": month_key(d),
                 "備考": clean_text(note),
             }
         )
@@ -967,48 +946,42 @@ def dialog_add_expense(default_month: str):
         st.rerun()
 
 
-@st.dialog("収入を登録")
+@st.dialog("収入の登録")
 def dialog_add_income(default_month: str):
-    months = collect_months(
+    months_opt = collect_months(
         st.session_state.df_exp, st.session_state.df_inc, st.session_state.df_fix
     )
-    # 現在選択されている月をデフォルト選択位置にする
-    default_idx = months.index(default_month) if default_month in months else 0
+    default_idx = months_opt.index(default_month) if default_month in months_opt else 0
 
-    target_month = st.selectbox("対象の月（何月分）", months, index=default_idx)
+    target_month = st.selectbox("対象月", months_opt, index=default_idx)
     inc_type = st.selectbox("収入種別", INCOME_TYPES)
-    amount = st.number_input(
-        "金額（円）", min_value=0, step=1000, value=0, key="dlg_inc_amount"
-    )
+    amount = st.number_input("金額", min_value=0, step=1000, key="dlg_inc_amount")
     note = st.text_input(
-        "備考", placeholder="例: 8/25給料（9月分として計上）", key="dlg_inc_note"
+        "備考", key="dlg_inc_note"
     )
 
-    if st.button(
-        "登録する", type="primary", use_container_width=True, key="dlg_inc_submit"
-    ):
-        # 内部的な「日付」列にはその月の1日（例: 2026-09-01）を割り当て
+    if st.button("登録する", type="primary", use_container_width=True, key="dlg_inc_submit"):
+        # 日付は「対象月の1日」で登録（日付ベース集計で、その月分として扱われる）
         dummy_date = date.fromisoformat(f"{target_month}-01")
         append_income(
             {
                 "日付": dummy_date,
                 "種別": inc_type,
                 "金額": int(amount),
-                "集計月": target_month,
                 "備考": clean_text(note),
             }
         )
         st.success(f"{target_month} 分の収入を登録しました")
         st.rerun()
 
+
 # =========================================================
 # ヘッダー・月選択・登録ボタン
 # =========================================================
-st.title("家計簿ダッシュボード")
+st.title("家計簿")
 
 months = collect_months(df_exp, df_inc, df_fix)
 
-# 当月（YYYY-MM）をデフォルト選択位置にする
 today_m = datetime.today().strftime("%Y-%m")
 default_m_idx = months.index(today_m) if today_m in months else 0
 
@@ -1027,9 +1000,17 @@ with head_r:
         if st.button("＋ 収入", use_container_width=True):
             dialog_add_income(selected_month)
 
-# 当月データ
-m_exp = df_exp[df_exp["集計月"] == selected_month].copy() if not df_exp.empty else pd.DataFrame(columns=EXP_COLUMNS)
-m_inc = df_inc[df_inc["集計月"] == selected_month].copy() if not df_inc.empty else pd.DataFrame(columns=INC_COLUMNS)
+# 当月データ（日付から作った「集計月」で絞り込み）
+m_exp = (
+    df_exp[df_exp["集計月"] == selected_month].copy()
+    if not df_exp.empty
+    else pd.DataFrame(columns=EXP_COLUMNS)
+)
+m_inc = (
+    df_inc[df_inc["集計月"] == selected_month].copy()
+    if not df_inc.empty
+    else pd.DataFrame(columns=INC_COLUMNS)
+)
 current_fix_df, fix_is_virtual = get_fixed_for_month(df_fix, selected_month, fixed_budgets)
 
 totals = month_totals(df_exp, df_inc, df_fix, selected_month, fixed_budgets)
@@ -1046,7 +1027,7 @@ furniture_fund = calc_sinking_fund(
     df_exp, furniture_monthly, selected_month, furniture_start, category="家具家電"
 )
 
-allowance_monthly = allowance_monthly_contrib(settings, var_budgets)  # ← ここを修正
+allowance_monthly = allowance_monthly_contrib(settings, var_budgets)
 allowance_start = resolve_sinking_start("お小遣い", selected_month, settings)
 allowance_fund = calc_sinking_fund(
     df_exp, allowance_monthly, selected_month, allowance_start, group="お小遣い"
@@ -1069,33 +1050,24 @@ group_budget_df = build_group_budget_df(budget_df, allowance_fund)
 # =========================================================
 # KPI（総収入 / 総支出 / 総収支）
 # =========================================================
-st.subheader(f"{selected_month} の総合収支")
+st.subheader(f"{selected_month} の収支")
 
 kpi1, kpi2, kpi3 = st.columns(3)
 with kpi1:
-    st.metric("総収入", yen(total_income))
+    st.metric("収入", yen(total_income))
 with kpi2:
     st.metric(
-        "総支出",
+        "支出",
         yen(total_spend),
         delta=f"固定 {yen(total_fixed)} ＋ 変動 {yen(total_variable)}",
         delta_color="off",
     )
 with kpi3:
-    st.metric("総収支", yen(net_balance), delta="黒字" if net_balance >= 0 else "赤字")
+    st.metric("収支", yen(net_balance), delta="黒字" if net_balance >= 0 else "赤字")
 
 sub1, sub2, sub3 = st.columns(3)
-sub1.metric("繰越残高（前月まで）", yen(carryover))
-sub2.metric("手元見込み", yen(available))
-sub3.metric(
-    "確保済み（積立＋貯蓄）",
-    yen(free_now["reserved_total"]),
-    delta=f"家具 {yen(free_now['reserved_furniture'])} / 小遣い {yen(free_now['reserved_allowance'])} / 貯蓄 {yen(free_now['reserved_savings'])}",
-    delta_color="off",
-)
-st.caption(
-    "繰越残高・手元見込みは、総収支の累計から「家具家電積立残高」「お小遣い積立残高」「月次貯蓄の確保額」を差し引いた自由に使える金額です。"
-)
+sub1.metric("繰越（前月まで）", yen(carryover))
+sub2.metric("残高", yen(available))
 
 # 貯蓄目標（ダッシュボード）
 savings_goal = int(settings.get("貯蓄目標", 0))
@@ -1103,8 +1075,8 @@ cum_savings = int(savings_info["reserved"])
 st.markdown("#### 貯蓄")
 goal_note = str(settings.get("貯蓄目標メモ", "") or "")
 s1, s2 = st.columns(2)
-s1.metric("月次貯蓄額", yen(savings_info["monthly"]))
-s2.metric("累計貯蓄（確保）", yen(cum_savings), delta=f"{savings_info['months']}ヶ月分")
+s1.metric("貯蓄額", yen(savings_info["monthly"]))
+s2.metric("累計貯蓄総額", yen(cum_savings), delta=f"{savings_info['months']}ヶ月分")
 if savings_goal > 0:
     progress = min(max(cum_savings / savings_goal, 0.0), 1.0)
     remain = max(savings_goal - cum_savings, 0)
@@ -1114,18 +1086,20 @@ if savings_goal > 0:
         + (f"  — {goal_note}" if goal_note else ""),
     )
     st.caption(
-        f"目標まであと {yen(remain)}" if remain > 0 else "目標達成です。設定タブで目標額・月次貯蓄額を変更できます。"
+        f"目標まであと {yen(remain)}"
+        if remain > 0
+        else "目標達成です。設定タブで目標額・月次貯蓄額を変更できます。"
     )
 else:
     st.caption("貯蓄目標が未設定です。設定タブで目標額と月次貯蓄額を入力してください。")
 
 # 積立カード（家具家電・お小遣い）
-st.markdown("#### 積立残高")
+st.markdown("#### 積立")
 col_f, col_a = st.columns(2)
 
 with col_f:
     st.metric(
-        label="家具家電",
+        label="家具家電 積立残高",
         value=yen(furniture_fund["balance"]),
         delta=f"月次: {yen(furniture_fund['monthly'])}",
         delta_color="off",
@@ -1135,7 +1109,7 @@ with col_f:
 
 with col_a:
     st.metric(
-        label="お小遣い",
+        label="お小遣い 残高",
         value=yen(allowance_fund["balance"]),
         delta=f"月次: {yen(allowance_fund['monthly'])}",
         delta_color="off",
@@ -1152,7 +1126,6 @@ if not over_normal.empty:
     )
     st.warning(f"予算超過カテゴリ: {labels}")
 if not over_fund.empty:
-    # お小遣いは区分でまとめて1回だけ表示
     seen = set()
     parts = []
     for _, row in over_fund.iterrows():
@@ -1168,8 +1141,7 @@ st.divider()
 # =========================================================
 # 区分別予実
 # =========================================================
-st.markdown("#### 区分別 予実サマリー")
-st.caption("使用率の色: 青(0%) → 緑 → 黄 → 橙 → 赤(超過)。残予算がマイナスの行は赤文字です。")
+st.markdown("#### 区分別サマリー")
 col_g_tbl, col_g_fig = st.columns([1, 1])
 with col_g_tbl:
     st.dataframe(style_budget_table(group_budget_df), use_container_width=True, hide_index=True)
@@ -1182,16 +1154,12 @@ st.divider()
 # タブ
 # =========================================================
 tab_exp, tab_fix, tab_inc, tab_trend, tab_year, tab_settings = st.tabs(
-    ["変動費", "固定費", "収入", "月次トレンド", "年次サマリー", "設定"]
+    ["変動費", "固定費", "収入", "月次サマリー", "年次サマリー", "設定"]
 )
 
 # ----- 変動費 -----
 with tab_exp:
-    st.markdown("#### カテゴリ別 予実")
-    st.caption(
-        "積立（家具家電・お小遣い）: 残予算＝積立残高、使用率＝累計支出÷累計積立。"
-        "お小遣いの残予算は区分全体で共通です。"
-    )
+    st.markdown("#### カテゴリ別")
     col_c_tbl, col_c_fig = st.columns([1.3, 1])
     with col_c_tbl:
         st.dataframe(
@@ -1203,12 +1171,20 @@ with tab_exp:
             height=580,
         )
     with col_c_fig:
-        st.plotly_chart(
-            usage_bar_chart(budget_df, "カテゴリ", title="カテゴリ別 使用率", height=450),
-            use_container_width=True,
+
+        fig = usage_bar_chart(
+            df=budget_df,
+            y_col="カテゴリ",
+            title="カテゴリ別 使用率",
+            height=450,
         )
 
-    st.markdown("#### カテゴリ別 金額グラフ")
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+    )
+
+    st.markdown("#### カテゴリ別グラフ")
     g1, g2 = st.columns(2)
     with g1:
         fig_amt = px.bar(
@@ -1220,7 +1196,7 @@ with tab_exp:
             text="実績",
             category_orders={"区分": GROUP_ORDER, "カテゴリ": ALL_CATEGORIES},
             color_discrete_sequence=["#3498DB", "#9B59B6", "#1ABC9C"],
-            title="今月の実績額",
+            title="今月の実績",
         )
         fig_amt.update_traces(texttemplate="¥%{text:,.0f}", textposition="outside")
         fig_amt.update_layout(
@@ -1244,15 +1220,15 @@ with tab_exp:
             fig_pie_cat.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
             st.plotly_chart(fig_pie_cat, use_container_width=True)
 
-    st.markdown("#### 今月の変動費明細")
+    st.markdown("#### 変動費明細")
     if m_exp.empty:
-        st.info("今月の変動費はまだありません。「＋ 支出」から登録してください。")
+        st.info("今月の変動費はまだありません。「＋支出」から登録してください。")
     else:
         filter_cols = st.columns([1, 2.5])
         with filter_cols[0]:
             filter_group = st.multiselect("区分で絞り込み", GROUP_ORDER, default=GROUP_ORDER)
         with filter_cols[1]:
-            filter_pay = st.multiselect("支払い方法", PAYMENT_METHODS, default=PAYMENT_METHODS)
+            filter_pay = st.multiselect("支払い方法で絞り込み", PAYMENT_METHODS, default=PAYMENT_METHODS)
 
         view = m_exp[m_exp["区分"].isin(filter_group) & m_exp["支払い方法"].isin(filter_pay)].copy()
         view = view.sort_values("日付", ascending=False)
@@ -1263,7 +1239,6 @@ with tab_exp:
         else:
             display_df = view.copy()
             display_df["削除"] = False
-            # 区分は表示のみ（カテゴリ変更時に自動同期）
             edit_cols = ["日付", "区分", "カテゴリ", "内容", "金額", "支払い方法", "備考", "削除"]
 
             edited = st.data_editor(
@@ -1298,53 +1273,76 @@ with tab_exp:
 
             selected_positions = [i for i, flag in enumerate(edited["削除"].tolist()) if flag]
             if selected_positions:
-                if st.button(f"選択した {len(selected_positions)} 件の支出を削除", type="primary", key="del_exp"):
+                if st.button(
+                    f"選択した {len(selected_positions)} 件の支出を削除", type="primary", key="del_exp"
+                ):
                     st.session_state.df_exp = delete_by_positions(
-                        st.session_state.df_exp, orig_indices, selected_positions
+                        "expenses", st.session_state.df_exp, orig_indices, selected_positions
                     )
-                    save_all_data()
                     st.success(f"{len(selected_positions)} 件を削除しました")
                     st.rerun()
 
         # 支払い方法別集計
-        if not m_exp.empty:
-            st.markdown("##### 支払い方法別 内訳")
-            pay_sum = (
-                m_exp.groupby("支払い方法", as_index=False)["金額"]
-                .sum()
-                .sort_values("金額", ascending=False)
-            )
-            fig_pay = px.pie(pay_sum, names="支払い方法", values="金額", hole=0.4)
-            fig_pay.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_pay, use_container_width=True)
+        st.markdown("##### 支払い方法別 内訳")
+        pay_sum = (
+            m_exp.groupby("支払い方法", as_index=False)["金額"]
+            .sum()
+            .sort_values("金額", ascending=False)
+        )
+        fig_pay = px.pie(pay_sum, names="支払い方法", values="金額", hole=0.4)
+        fig_pay.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig_pay, use_container_width=True)
 
 # ----- 固定費 -----
 with tab_fix:
     st.markdown(f"#### {selected_month} の固定費")
+    
+    display_fix = current_fix_df.copy()
+
+    # 1. DEFAULT_FIXED_BUDGET の順番を定義
+    ordered_items = list(DEFAULT_FIXED_BUDGET.keys())
+    existing_items = display_fix["項目"].tolist() if "項目" in display_fix.columns else []
+    
+    # 不足している予算項目があれば追加
+    for item in ordered_items:
+        if item not in existing_items:
+            new_row = pd.DataFrame([{"項目": item, "金額": 0, "備考": "-"}])
+            display_fix = pd.concat([display_fix, new_row], ignore_index=True)
+
+    # 💡 2. DEFAULT_FIXED_BUDGET の並び順通りにソート（並び替え）
+    display_fix["項目"] = pd.Categorical(display_fix["項目"], categories=ordered_items, ordered=True)
+    display_fix = display_fix.sort_values("項目").reset_index(drop=True)
+    display_fix["項目"] = display_fix["項目"].astype(str)  # 編集エラー防止のため文字列に戻す
+
+    # 3. 予算の紐付け
+    display_fix["予算"] = display_fix["項目"].map(
+        lambda x: int(fixed_budgets.get(x, DEFAULT_FIXED_BUDGET.get(x, 0)))
+    )
+
+    # 4. 未確定月（fix_is_virtual）の場合、または実績が0/Noneの場合は「実績（金額）」を None（ハイフン表示）にする
     if fix_is_virtual:
-        st.caption("この月の固定費は未確定です。金額を編集すると標準目安額で初期登録されます。")
+        st.caption("この月の固定費は未確定です。確定額を入力すると登録されます。")
+        display_fix["確定額"] = None  # None にすると data_editor で '-' (ハイフン) 表示になります
+        display_fix["差額"] = display_fix["予算"]
     else:
         st.caption("金額を直接編集すると即座に保存されます。")
+        # 実績がある場合: 0円の項目は None (ハイフン) にするか数値をそのまま保持
+        display_fix["確定額"] = display_fix["金額"].apply(lambda v: int(v) if pd.notna(v) and v != 0 else None)
+        display_fix["差額"] = display_fix["予算"] - display_fix["確定額"].fillna(0)
 
-    # 選択された月の固定費データを取得
-    display_fix = df_fix[df_fix["集計月"] == selected_month].copy() if not df_fix.empty else pd.DataFrame()
+    # 不足カラムの補完
+    if "備考" not in display_fix.columns:
+        display_fix["備考"] = "-"
 
-    # 「項目」列が含まれていない場合の補完処理
-    if "項目" not in display_fix.columns:
-        display_fix = pd.DataFrame(columns=["集計月", "項目", "金額", "備考"])
+    fix_orig = None if fix_is_virtual else current_fix_df.index
 
-    # 予算列の追加（安全な参照）
-    display_fix["予算"] = display_fix["項目"].map(lambda x: int(fixed_budgets.get(x, 0))) if not display_fix.empty else []
-    display_fix["差額"] = display_fix["予算"] - display_fix["金額"]
-
-    fix_orig = current_fix_df.index if not fix_is_virtual else pd.Index([])
-
+    # 5. データエディタの描画
     edited_fix = st.data_editor(
-        display_fix[["項目", "予算", "金額", "差額", "備考"]],
+        display_fix[["項目", "予算", "確定額", "差額", "備考"]],
         column_config={
-            "項目": st.column_config.TextColumn("固定費項目", disabled=True),
+            "項目": st.column_config.TextColumn("カテゴリ", disabled=True),
             "予算": st.column_config.NumberColumn("予算", format="¥%d", disabled=True),
-            "金額": st.column_config.NumberColumn("今月の確定額", min_value=0, format="¥%d"),
+            "確定額": st.column_config.NumberColumn("確定額", min_value=0, format="¥%d", help="入力がない場合は - と表示されます"),
             "差額": st.column_config.NumberColumn("予算−実績", format="¥%d", disabled=True),
             "備考": st.column_config.TextColumn("備考"),
         },
@@ -1353,28 +1351,37 @@ with tab_fix:
         key="fix_editor",
     )
 
-    # 変更検知（仮想 or 実データ）
-    baseline_amount = display_fix["金額"].map(to_int_amount).tolist()
-    baseline_note = display_fix["備考"].map(lambda x: clean_text(x)).tolist()
-    new_amount = edited_fix["金額"].map(to_int_amount).tolist()
-    new_note = edited_fix["備考"].map(lambda x: clean_text(x)).tolist()
-    fix_changed = baseline_amount != new_amount or baseline_note != new_note
+    # 6. 編集差分チェックと保存処理
+    baseline_fix = (
+        display_fix["確定額"].map(to_int_amount).tolist(),
+        display_fix["備考"].map(clean_text).tolist(),
+    )
+    new_fix = (
+        edited_fix["確定額"].map(to_int_amount).tolist(),
+        edited_fix["備考"].map(clean_text).tolist(),
+    )
 
-    if fix_changed:
-        persist_payload = edited_fix[["項目", "金額", "備考"]].copy()
-        persist_payload["集計月"] = selected_month
-        persist_fixed_month(persist_payload, selected_month, fix_is_virtual, fix_orig if not fix_is_virtual else None)
+    if baseline_fix != new_fix:
+        # 保存用に「確定額」を「金額」列に戻す (None は 0 に変換)
+        save_df = edited_fix.copy()
+        save_df["金額"] = save_df["確定額"].fillna(0).astype(int)
+        
+        persist_fixed_month(
+            save_df[["項目", "金額", "備考"]].copy(), selected_month, fix_is_virtual, fix_orig
+        )
         st.toast("固定費を更新しました", icon="💾")
         st.rerun()
 
-    fix_budget_total = int(sum(fixed_budgets.values()))
-    st.caption(f"固定費合計 {yen(total_fixed)} ／ 予算合計 {yen(fix_budget_total)}")
+    # 合計の計算（確定している金額のみ合計）
+    act_total = int(edited_fix["確定額"].fillna(0).sum())
+    fix_budget_total = int(sum(DEFAULT_FIXED_BUDGET.values()))
+    st.caption(f"固定費確定額合計 {yen(act_total)} ／ 予算合計 {yen(fix_budget_total)}")
 
 # ----- 収入 -----
 with tab_inc:
-    st.markdown(f"#### {selected_month} の収入明細")
+    st.markdown(f"#### {selected_month} の収入")
     if m_inc.empty:
-        st.info("今月の収入はまだありません。「＋ 収入」から登録してください。")
+        st.info("今月の収入はまだありません。「＋収入」から登録してください。")
     else:
         view_inc = m_inc.sort_values("日付", ascending=False)
         inc_indices = view_inc.index
@@ -1409,28 +1416,36 @@ with tab_inc:
 
         selected_inc_pos = [i for i, flag in enumerate(edited_inc["削除"].tolist()) if flag]
         if selected_inc_pos:
-            if st.button(f"選択した {len(selected_inc_pos)} 件の収入を削除", type="primary", key="del_inc"):
+            if st.button(
+                f"選択した {len(selected_inc_pos)} 件の収入を削除", type="primary", key="del_inc"
+            ):
                 st.session_state.df_inc = delete_by_positions(
-                    st.session_state.df_inc, inc_indices, selected_inc_pos
+                    "income", st.session_state.df_inc, inc_indices, selected_inc_pos
                 )
-                save_all_data()
                 st.success("収入データを削除しました")
                 st.rerun()
 
-# ----- 月次トレンド -----
+# ----- 月次サマリー -----
 with tab_trend:
-    st.markdown("#### 月次トレンド")
+    st.markdown("#### 月次サマリー")
     trend_df = build_monthly_trend(df_exp, df_inc, df_fix, fixed_budgets)
     if trend_df.empty:
         st.info("表示できる月次データがありません。")
     else:
-        melt = trend_df.melt(id_vars="集計月", value_vars=["収入", "固定費", "変動費", "収支"], var_name="項目", value_name="金額")
+        melt = trend_df.melt(
+            id_vars="集計月",
+            value_vars=["収入", "固定費", "変動費", "収支"],
+            var_name="項目",
+            value_name="金額",
+        )
         fig_trend = px.line(melt, x="集計月", y="金額", color="項目", markers=True)
         fig_trend.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="金額（円）")
         st.plotly_chart(fig_trend, use_container_width=True)
 
         st.dataframe(
-            trend_df.style.format({"収入": "¥{:,.0f}", "固定費": "¥{:,.0f}", "変動費": "¥{:,.0f}", "収支": "¥{:,.0f}"}),
+            trend_df.style.format(
+                {"収入": "¥{:,.0f}", "固定費": "¥{:,.0f}", "変動費": "¥{:,.0f}", "収支": "¥{:,.0f}"}
+            ),
             use_container_width=True,
             hide_index=True,
         )
@@ -1454,7 +1469,7 @@ with tab_year:
         y_net = int(year_df["収支"].sum())
 
         y1, y2, y3, y4 = st.columns(4)
-        y1.metric(f"{selected_year} 総収入", yen(y_income))
+        y1.metric(f"{selected_year}年 総収入", yen(y_income))
         y2.metric("総固定費", yen(y_fixed))
         y3.metric("総変動費", yen(y_var))
         y4.metric("年間収支", yen(y_net), delta="黒字" if y_net >= 0 else "赤字")
@@ -1470,7 +1485,6 @@ with tab_year:
         fig_year.update_layout(height=400, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="金額（円）")
         st.plotly_chart(fig_year, use_container_width=True)
 
-        # カテゴリ別年間変動費
         if not df_exp.empty:
             year_exp = df_exp[df_exp["集計月"].str.startswith(selected_year)]
             if not year_exp.empty:
@@ -1504,7 +1518,9 @@ with tab_settings:
     budget_edit_rows = []
     for group in GROUP_ORDER:
         for cat in CATEGORIES[group]:
-            budget_edit_rows.append({"区分": group, "カテゴリ": cat, "予算": int(var_budgets.get(cat, 0))})
+            budget_edit_rows.append(
+                {"区分": group, "カテゴリ": cat, "予算": int(var_budgets.get(cat, 0))}
+            )
     budget_edit_df = pd.DataFrame(budget_edit_rows)
 
     edited_budgets = st.data_editor(
@@ -1520,8 +1536,9 @@ with tab_settings:
         key="var_budget_editor",
     )
     if st.button("変動費予算を保存", type="primary", key="save_var_budget"):
-        new_budgets = {row["カテゴリ"]: to_int_amount(row["予算"]) for _, row in edited_budgets.iterrows()}
-        # 欠けたカテゴリはデフォルト維持
+        new_budgets = {
+            row["カテゴリ"]: to_int_amount(row["予算"]) for _, row in edited_budgets.iterrows()
+        }
         for cat in ALL_CATEGORIES:
             new_budgets.setdefault(cat, DEFAULT_VAR_BUDGET[cat])
         st.session_state.var_budgets = new_budgets
@@ -1530,10 +1547,8 @@ with tab_settings:
         st.rerun()
 
     st.divider()
-    st.markdown("#### 固定費の標準予算")
-    st.caption("新しい月の初期値として使われる標準額です。")
+    st.markdown("#### 固定費の予算")
     fixed_edit_rows = [{"項目": k, "予算": int(v)} for k, v in fixed_budgets.items()]
-    # デフォルトにない項目も残す
     for k, v in DEFAULT_FIXED_BUDGET.items():
         if k not in fixed_budgets:
             fixed_edit_rows.append({"項目": k, "予算": v})
@@ -1550,18 +1565,16 @@ with tab_settings:
         key="fixed_budget_editor",
     )
     if st.button("固定費予算を保存", type="primary", key="save_fixed_budget"):
-        new_fixed = {row["項目"]: to_int_amount(row["予算"]) for _, row in edited_fixed_budget.iterrows()}
+        new_fixed = {
+            row["項目"]: to_int_amount(row["予算"]) for _, row in edited_fixed_budget.iterrows()
+        }
         st.session_state.fixed_budgets = new_fixed
         save_fixed_budgets(new_fixed)
         st.success("固定費の標準予算を保存しました")
         st.rerun()
 
     st.divider()
-    st.markdown("#### 積立の開始月")
-    st.caption(
-        "家具家電はカテゴリ予算、お小遣いは趣味＋交際費＋娯楽雑費の合計を毎月積み立てます。"
-        "支出登録するだけで残高から減ります。"
-    )
+    st.markdown("#### 積立設定")
 
     current_furn_monthly = furniture_monthly_contrib(settings, var_budgets)
     current_allow_monthly = allowance_monthly_contrib(settings, var_budgets)
@@ -1570,33 +1583,31 @@ with tab_settings:
     with c_start1:
         st.markdown("##### 家具家電")
         sinking_amt_f = st.number_input(
-            "家具家電 月次積立額（円）",
+            "月次積立額（円）",
             min_value=0,
             step=1000,
             value=current_furn_monthly,
             key="sinking_amt_furniture",
         )
         sinking_start_f = st.text_input(
-            "家具家電 開始月（YYYY-MM）",
+            "積立開始月（YYYY-MM）",
             value=str(settings.get("積立開始月_家具家電", "") or selected_month),
             key="sinking_start_furniture",
         )
-        st.caption(f"月次積立: {yen(furniture_monthly)}")
     with c_start2:
         st.markdown("##### お小遣い")
         sinking_amt_a = st.number_input(
-            "お小遣い 月次積立額（円）",
+            "月次積立額（円）",
             min_value=0,
             step=1000,
             value=current_allow_monthly,
             key="sinking_amt_allowance",
         )
         sinking_start_a = st.text_input(
-            "お小遣い 開始月（YYYY-MM）",
+            "積立開始月（YYYY-MM）",
             value=str(settings.get("積立開始月_お小遣い", "") or selected_month),
             key="sinking_start_allowance",
         )
-        st.caption(f"月次積立: {yen(allowance_monthly)}")
 
     if st.button("積立設定を保存", type="primary", key="save_sinking"):
         errors = []
@@ -1612,7 +1623,6 @@ with tab_settings:
         if errors:
             st.error(f"YYYY-MM 形式で入力してください: {', '.join(errors)}")
         else:
-            # 1. 開始月と積立額をsettings.jsonに独立して保存
             vals["積立額_お小遣い"] = int(sinking_amt_a)
             vals["積立額_家具家電"] = int(sinking_amt_f)
 
@@ -1624,10 +1634,6 @@ with tab_settings:
 
     st.divider()
     st.markdown("#### 貯蓄設定")
-    st.caption(
-        "毎月この金額を「貯蓄」として手元から確保します。"
-        "繰越残高・手元見込みからは差し引かれ、下の目標進捗に加算されます。"
-    )
     sav_monthly = st.number_input(
         "月次貯蓄額（円）",
         min_value=0,
@@ -1654,7 +1660,9 @@ with tab_settings:
         key="savings_goal_note",
     )
     progress_set = min(cum_savings / goal, 1.0) if goal > 0 else 0.0
-    st.progress(progress_set, text=f"進捗 {yen(cum_savings)} / {yen(goal)}（{progress_set * 100:.1f}%）")
+    st.progress(
+        progress_set, text=f"進捗 {yen(cum_savings)} / {yen(goal)}（{progress_set * 100:.1f}%）"
+    )
     remain_set = max(goal - cum_savings, 0)
     st.caption(f"目標まであと {yen(remain_set)}" if remain_set > 0 else "目標達成です")
 
@@ -1678,7 +1686,7 @@ with tab_settings:
 
     st.divider()
     st.markdown("#### データバックアップ")
-    if st.button("CSV を再読み込み（ディスクから）"):
+    if st.button("DB から再読み込み"):
         st.session_state.df_exp, st.session_state.df_inc, st.session_state.df_fix = load_data()
         st.session_state.var_budgets = load_var_budgets()
         st.session_state.fixed_budgets = load_fixed_budgets()
@@ -1686,43 +1694,26 @@ with tab_settings:
         st.success("再読み込みしました")
         st.rerun()
 
-    # ダウンロード
     dl1, dl2, dl3 = st.columns(3)
     with dl1:
         st.download_button(
-            "変動費 CSV",
+            "変動費 CSV出力",
             data=st.session_state.df_exp.to_csv(index=False).encode("utf-8-sig"),
             file_name="household_expenses.csv",
             mime="text/csv",
         )
     with dl2:
         st.download_button(
-            "収入 CSV",
-            data=st.session_state.df_inc.to_csv(index=False).encode("utf-8-sig"),
-            file_name="household_income.csv",
-            mime="text/csv",
-        )
-    with dl3:
-        st.download_button(
-            "固定費 CSV",
+            "固定費 CSV出力",
             data=st.session_state.df_fix.to_csv(index=False).encode("utf-8-sig"),
             file_name="household_fixed_monthly.csv",
             mime="text/csv",
         )
+    with dl3:
+        st.download_button(
+            "収入 CSV出力",
+            data=st.session_state.df_inc.to_csv(index=False).encode("utf-8-sig"),
+            file_name="household_income.csv",
+            mime="text/csv",
+        )
 
-    # 設定タブや一時領域に配置
-    if st.button("既存のCSVデータをSupabaseへ移行"):
-        if os.path.exists("household_expenses.csv"):
-            df_old = pd.read_csv("household_expenses.csv")
-            for _, row in df_old.iterrows():
-                save_expense_item(
-                    date_str=str(row["日付"]),
-                    group=str(row["区分"]),
-                    category=str(row["カテゴリ"]),
-                    content=str(row.get("内容", "-")),
-                    amount=int(row["金額"]),
-                    pay_method=str(row.get("支払い方法", "現金")),
-                    month_key=str(row["集計月"]),
-                    note=str(row.get("備考", "-"))
-                )
-            st.success("CSVデータの移行が完了しました！")
