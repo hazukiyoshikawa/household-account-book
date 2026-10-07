@@ -24,10 +24,24 @@ st.set_page_config(page_title="家計簿アプリ", layout="wide")
 # =========================================================
 # Supabase 接続
 # =========================================================
+import os
+
 @st.cache_resource
 def init_supabase() -> Client:
-    url = st.secrets["supabase"]["SUPABASE_URL"]
-    key = st.secrets["supabase"]["SUPABASE_KEY"]
+    # 1. 環境変数からの取得を優先（Render用）
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    
+    # 2. 環境変数になければ secrets.toml から取得（ローカルPC用）
+    if not url or not key:
+        if "supabase" in st.secrets:
+            url = st.secrets["supabase"].get("SUPABASE_URL")
+            key = st.secrets["supabase"].get("SUPABASE_KEY")
+            
+    if not url or not key:
+        st.error("Supabaseの接続情報（SUPABASE_URL, SUPABASE_KEY）が見つかりません。")
+        st.stop()
+        
     return create_client(url, key)
 
 
